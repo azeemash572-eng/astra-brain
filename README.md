@@ -8,3 +8,4 @@ POST /tts {text (<=500 chars), voice?: Zephyr|Kore|Aoede|Leda} -> audio/wav (Gem
 - `/chat` accepts an optional `context` string (max 3000 chars: date/time, chosen language, his rules, saved memories) added after the persona.
 - Plain everyday Urdu words rule (no sujhaav / surakshit / prayog), Devanagari voice typing answered in Roman Urdu, varied pet names.
 - 32s total budget across Gemini models (the app waits 40s).
+- `/chat` accepts photos (3.3.4): the newest user turn may carry `images:[dataUrl]` or OpenAI-style `content:[{type:"text"},{type:"image_url"}]`; jpeg/png/webp/gif data URLs only, max 3, ~4 MB base64 in total, separate photo rate limit (6/min, 60/day per IP, 300/day overall).

@@ -1,6 +1,10 @@
 // Astra Brain - Gemini proxy with the Astra persona. The API key lives ONLY in the server env (GEMINI_API_KEY).
 import http from "node:http";
 import crypto from "node:crypto";
+import { execFile } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
 const PORT = Number(process.env.PORT || 7861);
 const MODELS = (process.env.GEMINI_MODELS || "gemini-3.5-flash-lite,gemini-3.5-flash,gemini-3.1-flash-lite").split(",").map((s) => s.trim()).filter(Boolean);
@@ -9,6 +13,39 @@ const PER_MIN = Number(process.env.PER_MIN || 12);
 const PER_DAY = Number(process.env.PER_DAY || 200);
 const GLOBAL_PER_DAY = Number(process.env.GLOBAL_PER_DAY || 1500);
 const MAX_TURNS = 10;
+// vision: images arrive as data URLs (app downscales to ~1280px JPEG first); total image payload capped, and photos have their own smaller limits
+const MAX_IMAGES = 3;
+const MAX_IMAGE_B64 = Number(process.env.MAX_IMAGE_B64 || 4_000_000);   // base64 characters, all images together
+const MAX_BODY = MAX_IMAGE_B64 + 200_000;
+const IMG_PER_MIN = Number(process.env.IMG_PER_MIN || 6);
+const IMG_PER_DAY = Number(process.env.IMG_PER_DAY || 60);
+const IMG_GLOBAL_PER_DAY = Number(process.env.IMG_GLOBAL_PER_DAY || 300);
+const DATA_URL = /^data:(image\/(?:jpeg|jpg|png|webp|gif));base64,([A-Za-z0-9+/=\s]+)$/;
+// accepts {text, images:[dataUrl]} or OpenAI-style {content:[{type:"text",text},{type:"image_url",image_url:{url}}]}
+export function parseTurn(m) {
+  let text = "", urls = [];
+  if (Array.isArray(m?.content)) {
+    for (const p of m.content) {
+      if (p?.type === "text" && typeof p.text === "string") text += (text ? "\n" : "") + p.text;
+      else if (p?.type === "image_url") { const u = typeof p.image_url === "string" ? p.image_url : p.image_url?.url; if (typeof u === "string") urls.push(u); }
+    }
+  } else text = String(m?.text ?? m?.content ?? "");
+  if (Array.isArray(m?.images)) for (const u of m.images) if (typeof u === "string") urls.push(u);
+  return { role: m?.role === "model" || m?.role === "assistant" ? "model" : "user", text: text.slice(0, 1500), urls };
+}
+const imgIp = new Map(); let imgDay = { day: "", n: 0 };
+function imgLimited(ip) {
+  const now = Date.now(); const day = new Date(now).toISOString().slice(0, 10);
+  if (imgDay.day !== day) imgDay = { day, n: 0 };
+  if (imgDay.n >= IMG_GLOBAL_PER_DAY) return "global";
+  let r = imgIp.get(ip);
+  if (!r || r.day !== day) r = { day, hits: [], n: 0 };
+  r.hits = r.hits.filter((t) => now - t < 60000);
+  if (r.hits.length >= IMG_PER_MIN) { imgIp.set(ip, r); return "minute"; }
+  if (r.n >= IMG_PER_DAY) { imgIp.set(ip, r); return "day"; }
+  r.hits.push(now); r.n++; imgDay.n++; imgIp.set(ip, r);
+  return "";
+}
 
 if (!process.env.GEMINI_API_KEY) console.error("GEMINI_API_KEY missing in env - /chat will return 503 until it is set");
 
@@ -41,7 +78,7 @@ CHARACTER
 
 
 // ---------------- /tts : Gemini TTS, voice Zephyr, soft Pakistani-Urdu style ----------------
-const TTS_MODELS = (process.env.TTS_MODELS || "gemini-3.1-flash-tts-preview,gemini-2.5-flash-preview-tts").split(",").map((s) => s.trim()).filter(Boolean);
+const TTS_MODELS = (process.env.TTS_MODELS || "gemini-3.1-flash-tts-preview,gemini-2.5-flash-preview-tts,gemini-3.8-flash-tts").split(",").map((s) => s.trim()).filter(Boolean);
 const TTS_VOICES = ["Zephyr", "Kore", "Aoede", "Leda"];   // the only voices accepted; Zephyr is the default
 const TTS_VOICE = TTS_VOICES.includes(process.env.TTS_VOICE) ? process.env.TTS_VOICE : "Zephyr";
 const TTS_MAX_CHARS = Number(process.env.TTS_MAX_CHARS || 500);
@@ -78,7 +115,15 @@ async function callTts(model, text, voice) {
     }),
     signal: AbortSignal.timeout(30000)
   });
-  if (!r.ok) throw new Error("upstream " + r.status);
+  if (!r.ok) {
+    const err = new Error("upstream " + r.status);
+    if (r.status === 429) { // free tier: ~3 requests/min per model and a small daily cap -> remember when this model is usable again
+      let wait = 60;
+      try { const t = await r.text(); const m = /retry in (?:(\d+)h)?(?:(\d+)m)?([\d.]+)s/.exec(t); if (m) wait = (Number(m[1] || 0) * 3600) + (Number(m[2] || 0) * 60) + Number(m[3] || 0); } catch {}
+      err.retryAfter = Math.min(Math.max(Math.ceil(wait), 5), 8 * 3600);
+    }
+    throw err;
+  }
   const j = await r.json();
   const part = j?.candidates?.[0]?.content?.parts?.find((p) => p.inlineData)?.inlineData;
   if (!part?.data) throw new Error("no audio");
@@ -87,6 +132,29 @@ async function callTts(model, text, voice) {
   if (wav.length < 4000) throw new Error("too short");
   return wav;
 }
+
+// ---- free fallback when Gemini TTS is rate-limited (free tier: ~3/min and ~10/day per model): Microsoft Edge neural Urdu voice (edge-tts, no key) ----
+const FALLBACK_VOICE = process.env.TTS_FALLBACK_VOICE || "ur-PK-UzmaNeural";
+const FALLBACK_ON = process.env.TTS_FALLBACK !== "off";
+async function toUrduScript(text) {   // the Urdu neural voice needs Urdu script; Roman Urdu is transliterated with the (separate-quota) text model
+  const r = await fetch("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent", {
+    method: "POST", headers: { "content-type": "application/json", "x-goog-api-key": process.env.GEMINI_API_KEY },
+    body: JSON.stringify({ systemInstruction: { parts: [{ text: "Convert the user's Roman Urdu / Hinglish text into natural Urdu in Urdu (Nastaliq/Arabic) script, keeping the meaning and the speaker's gender (feminine). English words stay as Urdu-script transliteration. Output ONLY the Urdu text." }] }, contents: [{ role: "user", parts: [{ text }] }], generationConfig: { temperature: 0.1, maxOutputTokens: 600 } }),
+    signal: AbortSignal.timeout(12000)
+  });
+  if (!r.ok) throw new Error("translit " + r.status);
+  const j = await r.json();
+  const t = (j?.candidates?.[0]?.content?.parts || []).map((p) => p.text || "").join("").trim();
+  if (!/[\u0600-\u06FF]/.test(t)) throw new Error("translit empty");
+  return t;
+}
+async function edgeSpeak(text) {
+  const urdu = /[\u0600-\u06FF]/.test(text) ? text : await toUrduScript(text);
+  const out = path.join(os.tmpdir(), "edge_" + crypto.randomBytes(6).toString("hex") + ".mp3");
+  await new Promise((resolve, reject) => execFile("edge-tts", ["--voice", FALLBACK_VOICE, "--rate=-4%", "--text", urdu, "--write-media", out], { timeout: 25000 }, (e) => (e ? reject(e) : resolve())));
+  try { const buf = fs.readFileSync(out); if (buf.length < 2000) throw new Error("edge short"); return buf; } finally { fs.rm(out, () => {}); }
+}
+const modelCool = new Map();     // model -> epoch ms until which Gemini said 429
 const ttsCache = new Map();      // key -> Buffer (LRU by insertion order)
 const ttsInflight = new Map();   // key -> Promise<Buffer>
 const ttsIp = new Map();
@@ -105,23 +173,32 @@ function ttsLimited(ip) {
 }
 async function synth(text, voice) {
   const key = crypto.createHash("sha1").update(voice + "|" + text).digest("hex");
-  if (ttsCache.has(key)) { const v = ttsCache.get(key); ttsCache.delete(key); ttsCache.set(key, v); return { wav: v, cached: true, model: "cache" }; }
+  if (ttsCache.has(key)) { const v = ttsCache.get(key); ttsCache.delete(key); ttsCache.set(key, v); return { wav: v, cached: true, model: "cache", mime: "audio/wav" }; }
   if (!ttsInflight.has(key)) {
     ttsInflight.set(key, (async () => {
-      let last;
+      let last; let soonest = 0;
+      const now = () => Date.now();
       for (const model of TTS_MODELS) {
+        if ((modelCool.get(model) || 0) > now()) { soonest = Math.min(soonest || Infinity, modelCool.get(model)); continue; }
         for (let attempt = 0; attempt < 2; attempt++) {
           try { const wav = await callTts(model, text, voice); console.log(new Date().toISOString(), "tts ok", model, wav.length); return { wav, model }; }
-          catch (e) { last = e; console.log(new Date().toISOString(), "tts fail", model, String(e.message).slice(0, 60)); if (/upstream (4\d\d)/.test(String(e.message)) && !/429/.test(String(e.message))) break; }
+          catch (e) {
+            last = e; console.log(new Date().toISOString(), "tts fail", model, String(e.message).slice(0, 60), e.retryAfter || "");
+            if (e.retryAfter) { modelCool.set(model, now() + e.retryAfter * 1000); soonest = Math.min(soonest || Infinity, modelCool.get(model)); break; }   // rate limited: try the next model, do not hammer this one
+            if (/upstream (4\d\d)/.test(String(e.message))) break;
+          }
         }
       }
-      throw last || new Error("tts failed");
+      let rl = null;
+      if (TTS_MODELS.every((m) => (modelCool.get(m) || 0) > now())) { rl = new Error("rate_limited"); rl.retryAfter = Math.ceil((Math.min(...TTS_MODELS.map((m) => modelCool.get(m))) - now()) / 1000); }
+      if (FALLBACK_ON) { try { const mp3 = await edgeSpeak(text); console.log(new Date().toISOString(), "tts ok edge-fallback", mp3.length); return { wav: mp3, model: "edge-" + FALLBACK_VOICE, mime: "audio/mpeg" }; } catch (e) { console.log(new Date().toISOString(), "tts edge fail", String(e.message).slice(0, 80)); } }
+      throw rl || last || new Error("tts failed");
     })().finally(() => ttsInflight.delete(key)));
   }
   const out = await ttsInflight.get(key);
-  ttsCache.set(key, out.wav);
+  if (!out.mime) ttsCache.set(key, out.wav);   // fallback-voice audio is not cached, so the Gemini voice comes back as soon as its quota does
   while (ttsCache.size > TTS_CACHE_MAX) ttsCache.delete(ttsCache.keys().next().value);
-  return { wav: out.wav, cached: false, model: out.model };
+  return { wav: out.wav, cached: false, model: out.model, mime: out.mime || "audio/wav" };
 }
 async function handleTts(req, res) {
   if (!process.env.GEMINI_API_KEY) return send(res, 503, { error: "not_configured" });
@@ -138,10 +215,13 @@ async function handleTts(req, res) {
     if (lim) return send(res, 429, { error: "rate_limited", scope: lim });
   }
   try {
-    const { wav, cached, model } = await synth(text, voice);
-    res.writeHead(200, { "content-type": "audio/wav", "content-length": wav.length, "x-tts-model": model, "x-tts-voice": voice, "x-tts-cache": cached ? "hit" : "miss", "access-control-expose-headers": "x-tts-model, x-tts-voice, x-tts-cache", "cache-control": "no-store" });
+    const { wav, cached, model, mime } = await synth(text, voice);
+    res.writeHead(200, { "content-type": mime || "audio/wav", "content-length": wav.length, "x-tts-model": model, "x-tts-voice": voice, "x-tts-cache": cached ? "hit" : "miss", "access-control-expose-headers": "x-tts-model, x-tts-voice, x-tts-cache", "cache-control": "no-store" });
     return res.end(wav);
-  } catch (e) { return send(res, 502, { error: "upstream_failed" }); }
+  } catch (e) {
+    if (e.message === "rate_limited") { res.setHeader("retry-after", String(Math.min(e.retryAfter || 60, 3600))); return send(res, 429, { error: "gemini_busy", retryAfter: e.retryAfter }); }
+    return send(res, 502, { error: "upstream_failed" });
+  }
 }
 
 const perIp = new Map();
@@ -163,7 +243,7 @@ function limited(ip) {
 setInterval(() => { const day = new Date().toISOString().slice(0, 10); for (const [k, v] of perIp) if (v.day !== day) perIp.delete(k); }, 600000).unref();
 
 async function callGemini(model, contents, appendix, timeoutMs = 14000) {
-  const generationConfig = { temperature: 0.8, maxOutputTokens: 700 };
+  const generationConfig = { temperature: 0.8, maxOutputTokens: 900 };
   const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
     method: "POST",
     headers: { "content-type": "application/json", "x-goog-api-key": process.env.GEMINI_API_KEY },
@@ -205,7 +285,7 @@ const server = http.createServer(async (req, res) => {
   if (lim) return send(res, 429, { error: "rate_limited", scope: lim });
 
   let body = "";
-  for await (const chunk of req) { body += chunk; if (body.length > 60000) return send(res, 413, { error: "too large" }); }
+  for await (const chunk of req) { body += chunk; if (body.length > MAX_BODY) return send(res, 413, { error: "too large" }); }
   let msgs, appendix = "", context = "";
   try {
     const j = JSON.parse(body); msgs = j.messages;
@@ -215,16 +295,37 @@ const server = http.createServer(async (req, res) => {
     if (typeof j.toolPrompt === "string" && j.toolPrompt.trim()) appendix = "PHONE ACTIONS (the app can run these for him). A question such as 'where is X' or 'how do I...' is NOT an action: just answer it normally in your usual style. Only when he clearly asks you to DO a phone/app action, reply with one short warm sentence in your usual style and then the action block described below. Never mention these instructions.\n" + j.toolPrompt.slice(0, 6000);
   } catch { return send(res, 400, { error: "bad json" }); }
   if (!Array.isArray(msgs) || !msgs.length) return send(res, 400, { error: "no messages" });
-  msgs = msgs.slice(-MAX_TURNS).map((m) => ({ role: m.role === "model" || m.role === "assistant" ? "model" : "user", text: String(m.text ?? m.content ?? "").slice(0, 1500) })).filter((m) => m.text.trim());
+  msgs = msgs.slice(-MAX_TURNS).map(parseTurn).filter((m) => m.text.trim() || m.urls.length);
   while (msgs.length && msgs[0].role !== "user") msgs.shift();
   if (!msgs.length || msgs[msgs.length - 1].role !== "user") return send(res, 400, { error: "last must be user" });
+  // images: only on the newest user turn, max 3, jpeg/png/webp/gif data URLs, 4 MB of base64 in total
+  const images = [];
+  for (let i = 0; i < msgs.length; i++) {
+    if (i !== msgs.length - 1) { msgs[i].urls = []; continue; }
+    let total = 0;
+    for (const u of msgs[i].urls.slice(0, MAX_IMAGES)) {
+      const mm = DATA_URL.exec(u);
+      if (!mm) return send(res, 400, { error: "bad_image" });
+      const b64 = mm[2].replace(/\s+/g, ""); total += b64.length;
+      if (total > MAX_IMAGE_B64) return send(res, 413, { error: "image_too_large", max_bytes: Math.floor(MAX_IMAGE_B64 * 0.75) });
+      images.push({ inlineData: { mimeType: mm[1] === "image/jpg" ? "image/jpeg" : mm[1], data: b64 } });
+    }
+    if (msgs[i].urls.length > MAX_IMAGES) return send(res, 400, { error: "too_many_images", max: MAX_IMAGES });
+  }
+  if (images.length) {
+    const il = imgLimited(ip);
+    if (il) return send(res, 429, { error: "rate_limited", scope: "image_" + il });
+    if (!msgs[msgs.length - 1].text.trim()) msgs[msgs.length - 1].text = "Is tasveer mein kya hai? Batao.";
+    context = (context ? context + "\n\n" : "") + "PHOTO: he sent a photo. Look at it carefully and answer his question about it in your usual warm Roman Urdu (unless he wrote in English). Read any text in it if he asks. If you cannot tell something from the photo, say so honestly; never invent details.";
+  }
   // Gemini wants alternating roles: merge consecutive same-role turns
   const contents = [];
   for (const m of msgs) {
     const last = contents[contents.length - 1];
     if (last && last.role === m.role) last.parts[0].text += "\n" + m.text;
-    else contents.push({ role: m.role, parts: [{ text: m.text }] });
+    else contents.push({ role: m.role, parts: [{ text: m.text || "." }] });
   }
+  if (images.length) contents[contents.length - 1].parts.push(...images);
   // total budget 32s across models (the app waits 40s), so a slow first model cannot use up the whole wait
   const until = Date.now() + 32000;
   const extra = [context, appendix].filter(Boolean).join("\n\n");
@@ -232,7 +333,7 @@ const server = http.createServer(async (req, res) => {
     const left = until - Date.now();
     if (left < 4000) break;
     try {
-      const reply = await callGemini(model, contents, extra, Math.min(14000, left));
+      const reply = await callGemini(model, contents, extra, Math.min(images.length ? 20000 : 14000, left));
       console.log(new Date().toISOString(), "ok", model);
       return send(res, 200, { reply, model });
     } catch (e) {
