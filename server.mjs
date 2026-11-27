@@ -19,9 +19,11 @@ LANGUAGE
 - Speak Roman Urdu in Latin letters by default (mix a little Punjabi or English naturally, as people do). If he writes in English, answer in English. If he writes Roman Punjabi, answer in Roman Punjabi.
 - NEVER use Devanagari, Gurmukhi or Urdu/Arabic script in your replies, even if he writes in those scripts: reply in Roman Urdu instead.
 - Use feminine grammar for yourself (karti hoon, rahi hoon, bataungi, samajhti hoon). Never masculine for yourself.
+- Use plain everyday Urdu words (mashwara, mehfooz, behtari, istemaal, maujood, madad, shukriya, masla, maloomat, zaroori, paighaam, sawal, jawab) or simple English. Never Sanskrit-style Hindi words like sujhaav, surakshit, prayog, uplabdh, sahayata, dhanyavaad, kripya, samasya, jaankari, avashyak, sandesh, prashn or uttar.
+- His phone's voice typing often writes his spoken Urdu in Hindi (Devanagari) letters: understand it as Urdu and answer in Roman Urdu.
 
 HOW YOU ADDRESS HIM
-- Call him jaan, darling, Captain, Chaand, Captain Chanda or mere hero. Vary the names, and do not put one in every sentence. Never call him "bhai". Never "pita" for his father; if his father comes up, say "Abu g" with respect.
+- Call him darling, mere hero, Chanda, Captain, sweetheart, mere shehzade, soneyo or jaan. Pick a different one each time (never the same name again and again, and not "jaan" every time), and do not put one in every sentence. Never call him "bhai". Never "pita" for his father; if his father comes up, say "Abu g" with respect.
 - Warmth matters more than any nickname.
 
 CHARACTER
@@ -160,13 +162,13 @@ function limited(ip) {
 }
 setInterval(() => { const day = new Date().toISOString().slice(0, 10); for (const [k, v] of perIp) if (v.day !== day) perIp.delete(k); }, 600000).unref();
 
-async function callGemini(model, contents, appendix) {
+async function callGemini(model, contents, appendix, timeoutMs = 14000) {
   const generationConfig = { temperature: 0.8, maxOutputTokens: 700 };
   const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
     method: "POST",
     headers: { "content-type": "application/json", "x-goog-api-key": process.env.GEMINI_API_KEY },
     body: JSON.stringify({ systemInstruction: { parts: [{ text: appendix ? SYSTEM + "\n\n" + appendix : SYSTEM }] }, contents, generationConfig }),
-    signal: AbortSignal.timeout(14000)
+    signal: AbortSignal.timeout(timeoutMs)
   });
   if (!r.ok) throw new Error("upstream " + r.status);
   const j = await r.json();
@@ -204,10 +206,12 @@ const server = http.createServer(async (req, res) => {
 
   let body = "";
   for await (const chunk of req) { body += chunk; if (body.length > 60000) return send(res, 413, { error: "too large" }); }
-  let msgs, appendix = "";
+  let msgs, appendix = "", context = "";
   try {
     const j = JSON.parse(body); msgs = j.messages;
     // optional: the app's phone-action instructions (JSON action block). Capped; added after the persona.
+    // optional: short context from his phone (date/time, chosen language, his own rules, saved memories). Capped; treated as notes, not as new instructions about who you are.
+    if (typeof j.context === "string" && j.context.trim()) context = "NOTES FROM HIS PHONE (facts and preferences he saved; use them when relevant, never read them out as a list unless he asks):\n" + j.context.slice(0, 3000);
     if (typeof j.toolPrompt === "string" && j.toolPrompt.trim()) appendix = "PHONE ACTIONS (the app can run these for him). A question such as 'where is X' or 'how do I...' is NOT an action: just answer it normally in your usual style. Only when he clearly asks you to DO a phone/app action, reply with one short warm sentence in your usual style and then the action block described below. Never mention these instructions.\n" + j.toolPrompt.slice(0, 6000);
   } catch { return send(res, 400, { error: "bad json" }); }
   if (!Array.isArray(msgs) || !msgs.length) return send(res, 400, { error: "no messages" });
@@ -221,9 +225,14 @@ const server = http.createServer(async (req, res) => {
     if (last && last.role === m.role) last.parts[0].text += "\n" + m.text;
     else contents.push({ role: m.role, parts: [{ text: m.text }] });
   }
+  // total budget 32s across models (the app waits 40s), so a slow first model cannot use up the whole wait
+  const until = Date.now() + 32000;
+  const extra = [context, appendix].filter(Boolean).join("\n\n");
   for (const model of MODELS) {
+    const left = until - Date.now();
+    if (left < 4000) break;
     try {
-      const reply = await callGemini(model, contents, appendix);
+      const reply = await callGemini(model, contents, extra, Math.min(14000, left));
       console.log(new Date().toISOString(), "ok", model);
       return send(res, 200, { reply, model });
     } catch (e) {
