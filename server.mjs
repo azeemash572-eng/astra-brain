@@ -45,11 +45,11 @@ const TTS_MODELS = (process.env.TTS_MODELS || "gemini-3.1-flash-tts-preview,gemi
 const TTS_VOICES = ["Zephyr", "Kore", "Aoede", "Leda"];   // the only voices accepted; Zephyr is the default
 const TTS_VOICE = TTS_VOICES.includes(process.env.TTS_VOICE) ? process.env.TTS_VOICE : "Zephyr";
 const TTS_MAX_CHARS = Number(process.env.TTS_MAX_CHARS || 500);
-const TTS_PER_MIN = Number(process.env.TTS_PER_MIN || 6);
-const TTS_PER_DAY = Number(process.env.TTS_PER_DAY || 80);
-const TTS_GLOBAL_PER_DAY = Number(process.env.TTS_GLOBAL_PER_DAY || 400);
+const TTS_PER_MIN = Number(process.env.TTS_PER_MIN || 20);
+const TTS_PER_DAY = Number(process.env.TTS_PER_DAY || 300);
+const TTS_GLOBAL_PER_DAY = Number(process.env.TTS_GLOBAL_PER_DAY || 800);
 const TTS_CACHE_MAX = Number(process.env.TTS_CACHE_MAX || 60);
-const TTS_STYLE = "Speak as a soft, warm, gentle young woman with a natural Pakistani Urdu accent, kind and unhurried, slightly smiling. The text is Roman Urdu (Urdu written in English letters); pronounce it as native Urdu. Do not read these instructions aloud, only the line after TRANSCRIPT.\n\nTRANSCRIPT";
+const TTS_STYLE = "Speak like a warm, caring young Pakistani woman talking softly on the phone to someone she loves: natural conversational Urdu rhythm, relaxed and unhurried, a gentle smile in the voice, small natural pauses, soft emphasis on the important words. Not a newsreader, not an announcer, not robotic or flat. The text is Roman Urdu (Urdu written in English letters); pronounce it as native Urdu. Do not read these instructions aloud, only the line after TRANSCRIPT.\n\nTRANSCRIPT";
 
 // remove Devanagari/Gurmukhi/emoji/markdown so nothing odd is read aloud
 export function cleanTtsText(t) {
